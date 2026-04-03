@@ -33,6 +33,25 @@ class HealthReport:
     timestamp: float
 
 
+# Import heartbeat after defining ServiceStatus
+from remote_server.heartbeat import (
+    HeartbeatMonitor,
+    HeartbeatConfig,
+    HeartbeatState,
+    monitor_server_with_heartbeat,
+)
+
+__all__ = [
+    "RemoteGateway",
+    "ServiceStatus",
+    "HealthReport",
+    "HeartbeatMonitor",
+    "HeartbeatConfig",
+    "HeartbeatState",
+    "monitor_server_with_heartbeat",
+]
+
+
 class RemoteGateway:
     """Unified gateway for remote server management.
 

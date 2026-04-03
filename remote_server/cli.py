@@ -2,9 +2,10 @@
 
 import argparse
 import sys
+import signal
 from pathlib import Path
 
-from remote_server import RemoteGateway
+from remote_server import RemoteGateway, monitor_server_with_heartbeat
 from remote_tmux.cli import add_remote_subparser as add_tmux_subparser
 
 
@@ -56,6 +57,38 @@ def cmd_ensure(args):
         sys.exit(1)
 
 
+def cmd_monitor(args):
+    """Monitor server with automatic heartbeat."""
+    try:
+        print(f"Starting heartbeat monitor for {args.profile}")
+        print(f"Check interval: {args.interval}s")
+        print("Press Ctrl+C to stop")
+        print()
+
+        monitor = monitor_server_with_heartbeat(
+            args.profile,
+            check_interval=args.interval,
+            verbose=True
+        )
+
+        # Set up signal handler for graceful shutdown
+        def signal_handler(sig, frame):
+            print("\nStopping monitor...")
+            monitor.stop()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        # Keep main thread alive
+        while True:
+            signal.pause()
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     """Main entry point for remote-server CLI."""
     parser = argparse.ArgumentParser(
@@ -95,6 +128,12 @@ Examples:
     p_ensure = subparsers.add_parser("ensure", help="Ensure server is healthy")
     p_ensure.add_argument("--profile", required=True, help="Profile name")
     p_ensure.set_defaults(func=cmd_ensure)
+
+    # Monitor command
+    p_monitor = subparsers.add_parser("monitor", help="Monitor server with heartbeat")
+    p_monitor.add_argument("--profile", required=True, help="Profile name")
+    p_monitor.add_argument("--interval", type=int, default=10, help="Check interval in seconds (default: 10)")
+    p_monitor.set_defaults(func=cmd_monitor)
 
     # Tmux commands (nested)
     p_tmux = subparsers.add_parser("tmux", help="Tmux session management")
