@@ -1,0 +1,22 @@
+# Remote lab profile configuration example
+#
+# Copy this file to profiles.local.yaml and customize for your setup.
+# profiles.local.yaml is gitignored and will not be committed.
+
+profiles:
+  # Example profile for Tsinghua lab server
+  tsinghua:
+    # SSH target (must match your ~/.ssh/config or be a valid hostname)
+    ssh_target: Tsinghua_node198
+
+    # Remote repository path
+    repo_path: ~/chrono-dsa
+
+    # Optional: tmux session name (defaults to chrono-ai-<profile_name>)
+    # session_name: chrono-ai-tsinghua
+
+  # Example profile for another server
+  # lab2:
+  #   ssh_target: lab2.example.com
+  #   repo_path: ~/projects/chrono-dsa
+  #   session_name: chrono-ai-lab2
