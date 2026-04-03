@@ -1,7 +1,7 @@
 [project]
-name = "remote-tmux-manager"
-version = "0.1.0"
-description = "AI-friendly remote tmux session manager for distributed experiments"
+name = "remote-server-toolkit"
+version = "0.2.0"
+description = "Comprehensive toolkit for remote server management and control"
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
@@ -20,6 +20,7 @@ dev = [
 
 [project.scripts]
 remote-tmux = "remote_tmux.cli:main"
+remote-server = "remote_server.cli:main"
 
 [build-system]
 requires = ["hatchling"]
