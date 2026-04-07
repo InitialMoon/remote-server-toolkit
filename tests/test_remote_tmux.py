@@ -92,12 +92,14 @@ class RemoteTmuxManagerTests(unittest.TestCase):
         manager = RemoteTmuxManager()
         command = manager.build_open_command(profile)
 
-        self.assertEqual(command[:2], ["ssh", "-tt"])
-        self.assertEqual(command[2], "Tsinghua")
+        self.assertEqual(command[:4], ["ssh", "-o", "ClearAllForwardings=yes", "-tt"])
+        self.assertEqual(command[4], "Tsinghua")
         script = command[-1]
         self.assertIn("tmux new-session -d -s \"$SESSION\" -n home", script)
         self.assertIn("tmux set-option -t \"$SESSION\" -q @chrono_managed 1", script)
         self.assertIn("tmux set-option -t \"$SESSION\" -q @chrono_profile \"$PROFILE\"", script)
+        self.assertIn("if ! tmux set-option -t \"$SESSION\" -gq window-size latest 2>/dev/null; then", script)
+        self.assertIn("tmux set-option -t \"$SESSION\" -gq window-size smallest", script)
         self.assertIn("tmux attach -t \"$SESSION\"", script)
 
     def test_build_send_command_targets_task_window_and_auto_cd(self) -> None:
@@ -111,7 +113,10 @@ class RemoteTmuxManagerTests(unittest.TestCase):
         manager = RemoteTmuxManager()
         command = manager.build_send_command(profile, "build-kernel", "git status", raw=False)
 
-        self.assertEqual(command[:4], ["ssh", "-o", "BatchMode=yes", "Tsinghua"])
+        self.assertEqual(
+            command[:6],
+            ["ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "Tsinghua"],
+        )
         script = command[-1]
         self.assertIn("TASK='build-kernel'", script)
         self.assertIn("cd ~/chrono-dsa && git status", script)
