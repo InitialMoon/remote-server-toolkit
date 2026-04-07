@@ -46,21 +46,32 @@ def cmd_ensure(args):
     """Ensure server is healthy (with auto-recovery)."""
     try:
         gateway = RemoteGateway(args.profile)
-        if gateway.ensure_healthy(auto_recover=True):
-            print(f"✓ Server {args.profile} is healthy")
+        report = gateway.get_orchestration_report(auto_recover=True, auto_create=True)
+        if report.orchestration_state.value == "inspecting_task":
+            print(f"✓ Remote {args.profile} is ready")
+            print(
+                f"  connectivity={report.connectivity_state.value} "
+                f"orchestration={report.orchestration_state.value}"
+            )
+            print(f"  reason={report.reason}")
             sys.exit(0)
-        else:
-            print(f"✗ Server {args.profile} is not healthy and recovery failed")
-            sys.exit(1)
+
+        print(f"✗ Remote {args.profile} is not ready")
+        print(
+            f"  connectivity={report.connectivity_state.value} "
+            f"orchestration={report.orchestration_state.value}"
+        )
+        print(f"  reason={report.reason}")
+        sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
 def cmd_monitor(args):
-    """Monitor server with automatic heartbeat."""
+    """Optionally monitor server state changes with automatic heartbeat."""
     try:
-        print(f"Starting heartbeat monitor for {args.profile}")
+        print(f"Starting optional heartbeat monitor for {args.profile}")
         print(f"Check interval: {args.interval}s")
         print("Press Ctrl+C to stop")
         print()
@@ -130,7 +141,10 @@ Examples:
     p_ensure.set_defaults(func=cmd_ensure)
 
     # Monitor command
-    p_monitor = subparsers.add_parser("monitor", help="Monitor server with heartbeat")
+    p_monitor = subparsers.add_parser(
+        "monitor",
+        help="Optional continuous observer for long waits and recovery windows",
+    )
     p_monitor.add_argument("--profile", required=True, help="Profile name")
     p_monitor.add_argument("--interval", type=int, default=10, help="Check interval in seconds (default: 10)")
     p_monitor.set_defaults(func=cmd_monitor)

@@ -1,85 +1,124 @@
-"""Automatic heartbeat monitoring and reconnection for remote servers.
+"""Structured heartbeat monitoring for remote orchestration.
 
-This module provides background heartbeat monitoring that:
-- Continuously checks server health
-- Automatically attempts recovery on failure
-- Provides status updates without blocking
-- Handles server reboots gracefully
+This module no longer treats "healthy/unhealthy" as the primary signal.
+Instead, it consumes orchestration reports and emits sparse, structured events
+that tell callers where progress is blocked and whether bounded recovery
+attempts helped.
 """
 
-import time
+from __future__ import annotations
+
 import threading
-from typing import Optional, Callable, TYPE_CHECKING
+import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING, Callable
+
+from remote_server.state_machine import (
+    ConnectivityStateId,
+    OrchestrationStateId,
+    TaskStateId,
+    TmuxStateId,
+)
 
 if TYPE_CHECKING:
-    from remote_server import RemoteGateway, ServiceStatus
+    from remote_server import OrchestrationReport, RemoteGateway, ServiceStatus
 else:
-    # Import at runtime to avoid circular import
+    OrchestrationReport = None
     RemoteGateway = None
     ServiceStatus = None
 
 
 class HeartbeatState(Enum):
     """Heartbeat monitor state."""
+
     RUNNING = "running"
     STOPPED = "stopped"
-    RECOVERING = "recovering"
+
+
+class RecoveryState(Enum):
+    """Current recovery status attached to emitted events."""
+
+    IDLE = "idle"
+    INFLIGHT = "inflight"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class HeartbeatEventKind(Enum):
+    """Stable event kinds emitted by the orchestration heartbeat."""
+
+    LIFECYCLE = "lifecycle"
+    STATE = "state"
+    BLOCKED = "blocked"
+    RECOVERY_STARTED = "recovery_started"
+    RECOVERY_SUCCEEDED = "recovery_succeeded"
+    RECOVERY_FAILED = "recovery_failed"
+
+
+@dataclass(frozen=True)
+class HeartbeatEvent:
+    """Structured event emitted by ``HeartbeatMonitor``."""
+
+    profile: str
+    kind: HeartbeatEventKind
+    connectivity_state: ConnectivityStateId
+    orchestration_state: OrchestrationStateId
+    tmux_state: TmuxStateId | None
+    task_state: TaskStateId | None
+    unchanged_count: int
+    recovery_state: RecoveryState
+    recovery_reason: str | None
+    message: str
+    timestamp: float
 
 
 @dataclass
 class HeartbeatConfig:
     """Heartbeat monitor configuration."""
-    check_interval: int = 10  # seconds between checks
-    timeout: int = 5  # seconds for each check
-    max_retries: int = 3  # retries before declaring unhealthy
-    recovery_interval: int = 30  # seconds between recovery attempts
-    reboot_wait_time: int = 120  # seconds to wait after detecting reboot
+
+    check_interval: int = 10
+    timeout: int = 5
+    max_retries: int = 3
+    recovery_interval: int = 30
 
 
 class HeartbeatMonitor:
-    """Background heartbeat monitor for remote servers.
-
-    Usage:
-        monitor = HeartbeatMonitor(gateway, on_status_change=callback)
-        monitor.start()
-        # ... do other work ...
-        monitor.stop()
-    """
+    """Background orchestration monitor for remote servers."""
 
     def __init__(
         self,
         gateway: "RemoteGateway",
-        config: Optional[HeartbeatConfig] = None,
-        on_status_change: Optional[Callable[["ServiceStatus", str], None]] = None
-    ):
-        """Initialize heartbeat monitor.
-
-        Args:
-            gateway: RemoteGateway instance to monitor
-            config: Optional configuration
-            on_status_change: Callback(status, message) when status changes
-        """
-        # Import here to avoid circular import
+        config: HeartbeatConfig | None = None,
+        on_event: Callable[[HeartbeatEvent], None] | None = None,
+        on_status_change: Callable[["ServiceStatus", str], None] | None = None,
+    ) -> None:
         from remote_server import ServiceStatus as SS
+
         global ServiceStatus
         ServiceStatus = SS
 
         self.gateway = gateway
         self.config = config or HeartbeatConfig()
+        self.on_event = on_event
         self.on_status_change = on_status_change
 
         self._state = HeartbeatState.STOPPED
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._last_status = ServiceStatus.UNKNOWN
-        self._consecutive_failures = 0
-        self._is_rebooting = False
-        self._reboot_detected_at: Optional[float] = None
 
-    def start(self):
-        """Start heartbeat monitoring in background thread."""
+        self._last_connectivity_state: ConnectivityStateId | None = None
+        self._last_orchestration_state: OrchestrationStateId | None = None
+        self._last_tmux_state: TmuxStateId | None = None
+        self._last_task_state: TaskStateId | None = None
+        self._last_report_time: float | None = None
+        self._unchanged_count = 0
+        self._recovery_inflight = False
+        self._last_recovery_reason: str | None = None
+        self._last_recovery_time: float | None = None
+
+    def start(self) -> None:
+        """Start heartbeat monitoring in a background thread."""
         if self._state == HeartbeatState.RUNNING:
             return
 
@@ -87,204 +126,303 @@ class HeartbeatMonitor:
         self._state = HeartbeatState.RUNNING
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
+        self._emit_lifecycle_event("monitor started")
 
-        self._notify_status_change(ServiceStatus.UNKNOWN, "Heartbeat monitor started")
-
-    def stop(self):
+    def stop(self) -> None:
         """Stop heartbeat monitoring."""
         if self._state == HeartbeatState.STOPPED:
             return
 
         self._stop_event.set()
-        if self._thread:
+        if self._thread is not None:
             self._thread.join(timeout=5)
-
         self._state = HeartbeatState.STOPPED
-        self._notify_status_change(ServiceStatus.UNKNOWN, "Heartbeat monitor stopped")
+        self._emit_lifecycle_event("monitor stopped")
 
-    def get_status(self) -> dict:
-        """Get current monitor status.
+    def check_once(self) -> None:
+        """Run one orchestration polling cycle and emit any resulting events."""
+        report = self.gateway.get_orchestration_report(auto_recover=False, auto_create=False)
+        self._handle_report(report)
 
-        Returns:
-            Dict with monitor state and server status
-        """
+    def get_status(self) -> dict[str, str | int | bool | None]:
+        """Get current monitor status."""
         return {
             "monitor_state": self._state.value,
-            "server_status": self._last_status.value,
-            "consecutive_failures": self._consecutive_failures,
-            "is_rebooting": self._is_rebooting,
             "profile": self.gateway.profile.name,
             "ssh_target": self.gateway.profile.ssh_target,
+            "connectivity_state": self._enum_value(self._last_connectivity_state),
+            "orchestration_state": self._enum_value(self._last_orchestration_state),
+            "tmux_state": self._enum_value(self._last_tmux_state),
+            "task_state": self._enum_value(self._last_task_state),
+            "unchanged_count": self._unchanged_count,
+            "recovery_inflight": self._recovery_inflight,
+            "last_recovery_reason": self._last_recovery_reason,
+            "last_report_time": self._last_report_time,
         }
 
-    def _monitor_loop(self):
-        """Main monitoring loop (runs in background thread)."""
+    def _monitor_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                # Check if we're waiting for reboot
-                if self._is_rebooting:
-                    self._handle_reboot_wait()
-                else:
-                    self._perform_health_check()
+                self.check_once()
+            except Exception as exc:
+                self._emit_lifecycle_event(f"monitor error: {exc}")
+            self._stop_event.wait(self.config.check_interval)
 
-                # Wait for next check
-                self._stop_event.wait(self.config.check_interval)
+    def _handle_report(self, report: "OrchestrationReport") -> None:
+        state_changed = self._has_state_changed(report)
 
-            except Exception as e:
-                # Don't let exceptions kill the monitor thread
-                self._notify_status_change(
-                    ServiceStatus.UNKNOWN,
-                    f"Monitor error: {str(e)}"
-                )
-                self._stop_event.wait(self.config.check_interval)
-
-    def _perform_health_check(self):
-        """Perform a single health check."""
-        report = self.gateway.check_health(force=True)
-        current_status = report.ssh_status
-
-        # Detect status change
-        if current_status != self._last_status:
-            self._on_status_transition(self._last_status, current_status, report)
-            self._last_status = current_status
-
-        # Handle failures
-        if current_status != ServiceStatus.HEALTHY:
-            self._consecutive_failures += 1
-
-            if self._consecutive_failures >= self.config.max_retries:
-                self._handle_persistent_failure(report)
+        if state_changed:
+            self._emit_report_event(
+                kind=HeartbeatEventKind.STATE,
+                report=report,
+                unchanged_count=0,
+                recovery_state=RecoveryState.IDLE,
+                recovery_reason=None,
+                message=report.reason or self._describe_report(report),
+            )
+            self._unchanged_count = 1
         else:
-            # Reset failure counter on success
-            if self._consecutive_failures > 0:
-                self._notify_status_change(
-                    ServiceStatus.HEALTHY,
-                    "Server recovered"
-                )
-            self._consecutive_failures = 0
+            self._unchanged_count += 1
 
-    def _on_status_transition(self, old_status, new_status, report):
-        """Handle status transition."""
-        if old_status == ServiceStatus.HEALTHY and new_status != ServiceStatus.HEALTHY:
-            # Server became unhealthy
-            self._notify_status_change(
-                new_status,
-                f"Server became unhealthy: {report.details.get('ssh', 'Unknown')}"
-            )
+        self._store_report_state(report)
 
-        elif old_status != ServiceStatus.HEALTHY and new_status == ServiceStatus.HEALTHY:
-            # Server recovered
-            self._notify_status_change(
-                ServiceStatus.HEALTHY,
-                "Server recovered and is now healthy"
-            )
-            self._is_rebooting = False
-            self._reboot_detected_at = None
-
-    def _handle_persistent_failure(self, report):
-        """Handle persistent connection failure."""
-        if self._state == HeartbeatState.RECOVERING:
-            return  # Already recovering
-
-        self._state = HeartbeatState.RECOVERING
-
-        # Check if this might be a reboot
-        ssh_detail = report.details.get('ssh', '')
-        if 'Connection refused' in ssh_detail or 'Timeout' in ssh_detail:
-            if not self._is_rebooting:
-                self._is_rebooting = True
-                self._reboot_detected_at = time.time()
-                self._notify_status_change(
-                    ServiceStatus.UNHEALTHY,
-                    f"Server appears to be rebooting (will wait {self.config.reboot_wait_time}s)"
-                )
-        else:
-            self._notify_status_change(
-                ServiceStatus.UNHEALTHY,
-                f"Persistent failure: {ssh_detail}"
-            )
-
-    def _handle_reboot_wait(self):
-        """Handle waiting for server reboot."""
-        if not self._reboot_detected_at:
+        if not self._is_blocked(report):
+            self._recovery_inflight = False
             return
 
-        elapsed = time.time() - self._reboot_detected_at
-        remaining = self.config.reboot_wait_time - elapsed
-
-        if remaining > 0:
-            # Still waiting
-            self._notify_status_change(
-                ServiceStatus.UNHEALTHY,
-                f"Waiting for reboot to complete ({int(remaining)}s remaining)"
+        if self._should_emit_blocked_event():
+            self._emit_report_event(
+                kind=HeartbeatEventKind.BLOCKED,
+                report=report,
+                unchanged_count=self._unchanged_count,
+                recovery_state=RecoveryState.IDLE,
+                recovery_reason=self._recovery_reason_for(report),
+                message=report.reason or self._describe_report(report),
             )
-        else:
-            # Try to reconnect
-            report = self.gateway.check_health(force=True)
-            if report.ssh_status == ServiceStatus.HEALTHY:
-                self._is_rebooting = False
-                self._reboot_detected_at = None
-                self._consecutive_failures = 0
-                self._state = HeartbeatState.RUNNING
-                self._notify_status_change(
-                    ServiceStatus.HEALTHY,
-                    "Server reboot completed successfully"
-                )
-            else:
-                # Still not up, extend wait time
-                self._reboot_detected_at = time.time()
-                self._notify_status_change(
-                    ServiceStatus.UNHEALTHY,
-                    f"Server not yet responsive, extending wait time"
-                )
 
-    def _notify_status_change(self, status: ServiceStatus, message: str):
-        """Notify callback of status change."""
-        if self.on_status_change:
+        if self._should_attempt_recovery(report):
+            self._attempt_recovery(report)
+
+    def _attempt_recovery(self, report: "OrchestrationReport") -> None:
+        recovery_reason = self._recovery_reason_for(report)
+        recovery_kwargs = self._recovery_kwargs_for(report)
+        if recovery_kwargs is None:
+            return
+
+        self._recovery_inflight = True
+        self._last_recovery_reason = recovery_reason
+        self._last_recovery_time = time.time()
+        self._emit_report_event(
+            kind=HeartbeatEventKind.RECOVERY_STARTED,
+            report=report,
+            unchanged_count=self._unchanged_count,
+            recovery_state=RecoveryState.INFLIGHT,
+            recovery_reason=recovery_reason,
+            message=f"recovery started: reason={recovery_reason}",
+        )
+
+        recovery_report = self.gateway.get_orchestration_report(**recovery_kwargs)
+        success = self._recovery_succeeded(before=report, after=recovery_report)
+        recovery_state = RecoveryState.SUCCEEDED if success else RecoveryState.FAILED
+        event_kind = (
+            HeartbeatEventKind.RECOVERY_SUCCEEDED
+            if success
+            else HeartbeatEventKind.RECOVERY_FAILED
+        )
+        message = (
+            f"recovery succeeded: reason={recovery_reason}"
+            if success
+            else f"recovery failed: reason={recovery_reason}"
+        )
+        self._emit_report_event(
+            kind=event_kind,
+            report=recovery_report,
+            unchanged_count=0 if success else self._unchanged_count,
+            recovery_state=recovery_state,
+            recovery_reason=recovery_reason,
+            message=message,
+        )
+
+        self._recovery_inflight = False
+        self._store_report_state(recovery_report)
+        self._unchanged_count = 1 if success else self._unchanged_count
+
+    def _emit_lifecycle_event(self, message: str) -> None:
+        connectivity_state = self._last_connectivity_state or ConnectivityStateId.UNKNOWN
+        orchestration_state = self._last_orchestration_state or OrchestrationStateId.UNKNOWN
+        event = HeartbeatEvent(
+            profile=self.gateway.profile.name,
+            kind=HeartbeatEventKind.LIFECYCLE,
+            connectivity_state=connectivity_state,
+            orchestration_state=orchestration_state,
+            tmux_state=self._last_tmux_state,
+            task_state=self._last_task_state,
+            unchanged_count=self._unchanged_count,
+            recovery_state=RecoveryState.IDLE,
+            recovery_reason=self._last_recovery_reason,
+            message=message,
+            timestamp=time.time(),
+        )
+        self._emit_event(event)
+
+    def _emit_report_event(
+        self,
+        *,
+        kind: HeartbeatEventKind,
+        report: "OrchestrationReport",
+        unchanged_count: int,
+        recovery_state: RecoveryState,
+        recovery_reason: str | None,
+        message: str,
+    ) -> None:
+        event = HeartbeatEvent(
+            profile=report.profile_name,
+            kind=kind,
+            connectivity_state=report.connectivity_state,
+            orchestration_state=report.orchestration_state,
+            tmux_state=report.tmux_state,
+            task_state=report.task_state,
+            unchanged_count=unchanged_count,
+            recovery_state=recovery_state,
+            recovery_reason=recovery_reason,
+            message=message,
+            timestamp=report.timestamp,
+        )
+        self._emit_event(event)
+
+    def _emit_event(self, event: HeartbeatEvent) -> None:
+        if self.on_event is not None:
             try:
-                self.on_status_change(status, message)
+                self.on_event(event)
             except Exception:
-                # Don't let callback exceptions break monitoring
                 pass
+
+        if self.on_status_change is not None:
+            try:
+                self.on_status_change(self._legacy_status_for(event), event.message)
+            except Exception:
+                pass
+
+    def _legacy_status_for(self, event: HeartbeatEvent) -> "ServiceStatus":
+        if event.orchestration_state in {
+            OrchestrationStateId.INSPECTING_TASK,
+            OrchestrationStateId.TASK_IDLE,
+            OrchestrationStateId.TASK_RUNNING,
+            OrchestrationStateId.TASK_SUCCEEDED,
+        }:
+            return ServiceStatus.HEALTHY
+        if event.orchestration_state == OrchestrationStateId.BLOCKED_TMUX:
+            return ServiceStatus.DEGRADED
+        if event.orchestration_state in {
+            OrchestrationStateId.BLOCKED_CONNECTIVITY,
+            OrchestrationStateId.TASK_FAILED,
+        }:
+            return ServiceStatus.UNHEALTHY
+        return ServiceStatus.UNKNOWN
+
+    def _has_state_changed(self, report: "OrchestrationReport") -> bool:
+        return (
+            report.connectivity_state != self._last_connectivity_state
+            or report.orchestration_state != self._last_orchestration_state
+            or report.tmux_state != self._last_tmux_state
+            or report.task_state != self._last_task_state
+        )
+
+    def _store_report_state(self, report: "OrchestrationReport") -> None:
+        self._last_connectivity_state = report.connectivity_state
+        self._last_orchestration_state = report.orchestration_state
+        self._last_tmux_state = report.tmux_state
+        self._last_task_state = report.task_state
+        self._last_report_time = report.timestamp
+
+    def _is_blocked(self, report: "OrchestrationReport") -> bool:
+        return report.orchestration_state in {
+            OrchestrationStateId.BLOCKED_CONNECTIVITY,
+            OrchestrationStateId.BLOCKED_TMUX,
+        }
+
+    def _should_emit_blocked_event(self) -> bool:
+        threshold = max(1, self.config.max_retries)
+        return self._unchanged_count >= threshold and self._unchanged_count % threshold == 0
+
+    def _should_attempt_recovery(self, report: "OrchestrationReport") -> bool:
+        if self._recovery_inflight:
+            return False
+
+        if self._recovery_kwargs_for(report) is None:
+            return False
+
+        if self._unchanged_count < max(1, self.config.max_retries):
+            return False
+
+        if self._last_recovery_time is None:
+            return True
+
+        return (time.time() - self._last_recovery_time) >= self.config.recovery_interval
+
+    def _recovery_kwargs_for(
+        self, report: "OrchestrationReport"
+    ) -> dict[str, bool] | None:
+        if report.orchestration_state == OrchestrationStateId.BLOCKED_CONNECTIVITY:
+            return {"auto_recover": True, "auto_create": False}
+        if report.orchestration_state == OrchestrationStateId.BLOCKED_TMUX:
+            return {"auto_recover": False, "auto_create": True}
+        return None
+
+    def _recovery_reason_for(self, report: "OrchestrationReport") -> str:
+        if report.orchestration_state == OrchestrationStateId.BLOCKED_CONNECTIVITY:
+            return report.connectivity_state.value
+        if report.orchestration_state == OrchestrationStateId.BLOCKED_TMUX:
+            if report.tmux_state is not None:
+                return report.tmux_state.value
+            return report.orchestration_state.value
+        return report.orchestration_state.value
+
+    def _recovery_succeeded(
+        self, *, before: "OrchestrationReport", after: "OrchestrationReport"
+    ) -> bool:
+        if before.orchestration_state == OrchestrationStateId.BLOCKED_CONNECTIVITY:
+            return after.orchestration_state != OrchestrationStateId.BLOCKED_CONNECTIVITY
+        if before.orchestration_state == OrchestrationStateId.BLOCKED_TMUX:
+            return after.orchestration_state != OrchestrationStateId.BLOCKED_TMUX
+        return False
+
+    def _describe_report(self, report: "OrchestrationReport") -> str:
+        parts = [
+            f"connectivity={report.connectivity_state.value}",
+            f"orchestration={report.orchestration_state.value}",
+        ]
+        if report.tmux_state is not None:
+            parts.append(f"tmux={report.tmux_state.value}")
+        if report.task_state is not None:
+            parts.append(f"task={report.task_state.value}")
+        if report.reason:
+            parts.append(f"reason={report.reason}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _enum_value(value: Enum | None) -> str | None:
+        return value.value if value is not None else None
 
 
 def monitor_server_with_heartbeat(
-    profile_name: str,
-    check_interval: int = 10,
-    verbose: bool = True
+    profile_name: str, check_interval: int = 10, verbose: bool = True
 ) -> HeartbeatMonitor:
-    """Convenience function to start monitoring a server.
-
-    Args:
-        profile_name: Profile name to monitor
-        check_interval: Seconds between checks
-        verbose: Print status updates
-
-    Returns:
-        HeartbeatMonitor instance (already started)
-
-    Example:
-        monitor = monitor_server_with_heartbeat("tsinghua")
-        # ... do other work ...
-        monitor.stop()
-    """
-    from remote_server import RemoteGateway, ServiceStatus
+    """Convenience function to start monitoring a server."""
+    from remote_server import RemoteGateway
 
     gateway = RemoteGateway(profile_name)
 
-    def status_callback(status: ServiceStatus, message: str):
-        if verbose:
-            timestamp = time.strftime("%H:%M:%S")
-            icon = {
-                ServiceStatus.HEALTHY: "✓",
-                ServiceStatus.DEGRADED: "⚠",
-                ServiceStatus.UNHEALTHY: "✗",
-                ServiceStatus.UNKNOWN: "?",
-            }.get(status, "?")
-            print(f"[{timestamp}] {icon} {message}")
+    def event_callback(event: HeartbeatEvent) -> None:
+        if not verbose:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] {event.kind.value} {event.message}")
 
-    config = HeartbeatConfig(check_interval=check_interval)
-    monitor = HeartbeatMonitor(gateway, config, on_status_change=status_callback)
+    monitor = HeartbeatMonitor(
+        gateway,
+        HeartbeatConfig(check_interval=check_interval),
+        on_event=event_callback,
+    )
     monitor.start()
-
     return monitor

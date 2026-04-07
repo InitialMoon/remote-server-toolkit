@@ -5,12 +5,27 @@ import sys
 from typing import List
 
 from remote_tmux.config import RemoteProfile
+from remote_tmux.safety import check_command_safety, CommandSafetySuggestion
+from remote_tmux.operation_log import get_logger
 
 
 class RemoteTmuxManager:
     """Manages remote tmux sessions for AI-driven workflows."""
 
     RESERVED_WINDOWS = {"home"}
+    SSH_CLEAR_FORWARDINGS = ["-o", "ClearAllForwardings=yes"]
+
+    def __init__(self):
+        """Initialize remote tmux manager."""
+        self._last_operation_id = None
+
+    def get_last_operation_id(self) -> str:
+        """Get the operation ID of the last command sent.
+
+        Returns:
+            Operation ID for tracking, or None if no command sent yet
+        """
+        return self._last_operation_id
 
     def validate_task_name(self, task_name: str) -> None:
         """Validate task name is not reserved.
@@ -23,6 +38,23 @@ class RemoteTmuxManager:
         """
         if task_name in self.RESERVED_WINDOWS:
             raise ValueError(f"Task name '{task_name}' is reserved")
+
+    def _build_ssh_command(
+        self,
+        profile: RemoteProfile,
+        script: str,
+        *,
+        interactive: bool = False,
+        batch_mode: bool = True,
+    ) -> List[str]:
+        """Build a consistent SSH command for remote tmux operations."""
+        command = ["ssh", *self.SSH_CLEAR_FORWARDINGS]
+        if interactive:
+            command.append("-tt")
+        if batch_mode:
+            command.extend(["-o", "BatchMode=yes"])
+        command.extend([profile.ssh_target, script.strip()])
+        return command
 
     def build_open_command(self, profile: RemoteProfile) -> List[str]:
         """Build ssh command to open/attach managed tmux session.
@@ -39,9 +71,16 @@ SESSION="{profile.session_name}"
 PROFILE="{profile.name}"
 REPO="{profile.repo_path}"
 
+apply_window_size_mode() {{
+    if ! tmux set-option -t "$SESSION" -gq window-size latest 2>/dev/null; then
+        tmux set-option -t "$SESSION" -gq window-size smallest
+    fi
+}}
+
 # Check if session exists
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Attaching to existing session: $SESSION"
+    apply_window_size_mode
     tmux attach -t "$SESSION"
 else
     echo "Creating new managed session: $SESSION"
@@ -51,12 +90,13 @@ else
     # Mark as chrono-managed
     tmux set-option -t "$SESSION" -q @chrono_managed 1
     tmux set-option -t "$SESSION" -q @chrono_profile "$PROFILE"
+    apply_window_size_mode
 
     # Attach
     tmux attach -t "$SESSION"
 fi
 """
-        return ["ssh", "-tt", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script, interactive=True, batch_mode=False)
 
     def build_status_command(self, profile: RemoteProfile) -> List[str]:
         """Build command to check session status.
@@ -76,7 +116,7 @@ else
     echo "Session: $SESSION (not running)"
 fi
 """
-        return ["ssh", "-o", "BatchMode=yes", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script)
 
     def build_list_tasks_command(self, profile: RemoteProfile) -> List[str]:
         """Build command to list task windows.
@@ -96,7 +136,7 @@ else
     exit 1
 fi
 """
-        return ["ssh", "-o", "BatchMode=yes", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script)
 
     def build_new_task_command(self, profile: RemoteProfile, task_name: str) -> List[str]:
         """Build command to create new task window.
@@ -128,7 +168,7 @@ fi
 tmux new-window -t "$SESSION" -n "$TASK" -c "$REPO"
 echo "Created task window: $TASK"
 """
-        return ["ssh", "-o", "BatchMode=yes", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script)
 
     def build_switch_task_command(self, profile: RemoteProfile, task_name: str) -> List[str]:
         """Build command to switch to task window.
@@ -158,7 +198,7 @@ fi
 tmux select-window -t "$SESSION:$TASK"
 echo "Switched to: $TASK"
 """
-        return ["ssh", "-o", "BatchMode=yes", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script)
 
     def build_send_command(
         self, profile: RemoteProfile, task_name: str, command: str, raw: bool = False
@@ -173,13 +213,55 @@ echo "Switched to: $TASK"
 
         Returns:
             Command list for subprocess execution
+
+        Note:
+            This method checks command safety and prints suggestions to stderr.
+            If command is unsafe (e.g., contains 'rm'), it will raise ValueError
+            with suggestions for safer alternatives.
         """
         self.validate_task_name(task_name)
+
+        # Check command safety
+        is_safe, suggestions = check_command_safety(command)
+
+        # Print suggestions if any
+        if suggestions:
+            print("\n" + "=" * 70, file=sys.stderr)
+            print("命令安全检查", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            for suggestion in suggestions:
+                print(f"\n{suggestion}", file=sys.stderr)
+            print("=" * 70 + "\n", file=sys.stderr)
+
+        # Block unsafe commands
+        if not is_safe:
+            error_suggestions = [s for s in suggestions if s.severity == "error"]
+            raise ValueError(
+                f"命令被安全检查拒绝。请使用建议的安全替代方案。\n" +
+                "\n".join(str(s) for s in error_suggestions)
+            )
 
         if raw:
             full_command = command
         else:
             full_command = f"cd {profile.repo_path} && {command}"
+
+        # Log operation before execution
+        logger = get_logger()
+        operation_id = logger.log_operation(
+            operation_type="send_command",
+            profile=profile.name,
+            command=full_command,
+            metadata={
+                "task_name": task_name,
+                "raw": raw,
+                "original_command": command,
+                "safety_warnings": len([s for s in suggestions if s.severity == "warning"])
+            }
+        )
+
+        # Store operation_id for later status update
+        self._last_operation_id = operation_id
 
         script = f"""
 set -e
@@ -198,7 +280,7 @@ fi
 
 tmux send-keys -t "$SESSION:$TASK" "{full_command}" C-m
 """
-        return ["ssh", "-o", "BatchMode=yes", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script)
 
     def build_capture_command(
         self, profile: RemoteProfile, task_name: str, lines: int = 120
@@ -230,7 +312,7 @@ fi
 
 tmux capture-pane -t "$SESSION:$TASK" -p -S -{lines}
 """
-        return ["ssh", "-o", "BatchMode=yes", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script)
 
     def build_close_task_command(self, profile: RemoteProfile, task_name: str) -> List[str]:
         """Build command to close task window.
@@ -261,7 +343,7 @@ fi
 tmux kill-window -t "$SESSION:$TASK"
 echo "Closed task window: $TASK"
 """
-        return ["ssh", "-o", "BatchMode=yes", profile.ssh_target, script.strip()]
+        return self._build_ssh_command(profile, script)
 
     def execute(self, command: List[str], check: bool = True) -> subprocess.CompletedProcess:
         """Execute command and return result.
