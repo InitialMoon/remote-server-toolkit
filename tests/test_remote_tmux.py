@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 # Import from package
+import remote_tmux.safety as safety
 from remote_tmux.config import RemoteProfile, load_remote_profiles
 from remote_tmux.manager import RemoteTmuxManager
 from remote_tmux.cli import add_remote_subparser
@@ -129,6 +130,13 @@ class RemoteTmuxManagerTests(unittest.TestCase):
             manager.validate_task_name("home")
 
         self.assertIn("reserved", str(ctx.exception))
+
+
+class RemoteTmuxSafetyApiTests(unittest.TestCase):
+    def test_safety_module_only_keeps_active_command_check_entrypoint(self) -> None:
+        self.assertTrue(hasattr(safety, "check_command_safety"))
+        self.assertFalse(hasattr(safety, "create_backup_command"))
+        self.assertFalse(hasattr(safety, "create_safe_delete_command"))
 
 
 if __name__ == "__main__":

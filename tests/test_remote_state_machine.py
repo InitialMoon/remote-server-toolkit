@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import remote_server
 from remote_bmc import BMCConfig
 from remote_server import OrchestrationReport, RemoteGateway, ServiceStatus
 from remote_server.state_machine import (
@@ -411,6 +412,12 @@ class RemoteGatewayInterfaceTests(unittest.TestCase):
         self.assertEqual(report.state, ConnectivityStateId.FAILED)
         self.assertEqual(report.details["bmc_detail"], "BMC is not configured.")
         self.assertEqual(report.reason, "BMC is not configured.")
+
+
+class PublicApiCleanupTests(unittest.TestCase):
+    def test_remote_server_does_not_export_legacy_experiment_runner(self) -> None:
+        self.assertNotIn("RemoteExperimentRunner", remote_server.__all__)
+        self.assertFalse(hasattr(remote_server, "RemoteExperimentRunner"))
 
 
 if __name__ == "__main__":

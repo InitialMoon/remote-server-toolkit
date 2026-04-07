@@ -1,242 +1,134 @@
 # Integration Guide
 
-## Using as a Git Submodule
+This toolkit is meant to sit under a project-specific remote CLI. The project
+owns user-facing workflow semantics; the toolkit owns reusable remote control.
 
-### Adding to Your Project
+## Recommended Architecture
+
+Keep the split explicit:
+
+- project CLI: commands such as `status`, `ensure`, `monitor`, `open`,
+  `tasks send`, `tasks capture`
+- toolkit facade: `RemoteGateway`
+- toolkit transport layer: `RemoteTmuxManager`
+- toolkit monitoring layer: `HeartbeatMonitor`
+
+In Chrono this looks like:
+
+```text
+main.py remote -> scripts/remote_cli.py -> remote_server / remote_tmux
+```
+
+## Project-Side Integration
+
+### 1. Install the submodule
 
 ```bash
-# In your project root
-git submodule add https://github.com/yourusername/remote-tmux-manager.git external/remote-tmux-manager
 git submodule update --init --recursive
+uv pip install -e external/remote-server-toolkit
 ```
 
-### Installing the Package
+### 2. Provide profile config
 
-```bash
-# Install in development mode
-pip install -e external/remote-tmux-manager
+Create `config/remote_tmux/profiles.local.yaml` in the integrating project:
 
-# Or with uv
-uv pip install -e external/remote-tmux-manager
+```yaml
+profiles:
+  tsinghua:
+    ssh_target: Tsinghua_node198
+    repo_path: ~/chrono-dsa
+    session_name: chrono-ai-tsinghua
 ```
 
-### Integration Method 1: CLI Integration
-
-Add remote commands to your existing CLI:
-
-```python
-# In your main.py
-import argparse
-from remote_tmux.cli import add_remote_subparser
-
-def main():
-    parser = argparse.ArgumentParser(description="Your project CLI")
-    subparsers = parser.add_subparsers(dest="command")
-
-    # Add your existing commands
-    # ...
-
-    # Add remote-tmux commands
-    add_remote_subparser(subparsers)
-
-    args = parser.parse_args()
-    # Handle commands...
-
-if __name__ == "__main__":
-    main()
-```
-
-Now your CLI will have:
-```bash
-python main.py remote profiles list
-python main.py remote open --profile myserver
-python main.py remote tasks new build --profile myserver
-```
-
-### Integration Method 2: Library Usage
-
-Use remote-tmux as a library in your code:
+### 3. Build a project-local gateway
 
 ```python
 from pathlib import Path
-from remote_tmux import RemoteTmuxManager, load_remote_profiles
 
-# Load profiles from your project config
-config_root = Path(__file__).parent / "config"
-profiles = load_remote_profiles(config_root)
+from remote_server import RemoteGateway
 
-# Get a profile
-profile = profiles["myserver"]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Create manager
-manager = RemoteTmuxManager()
 
-# Build and execute commands
-cmd = manager.build_send_command(profile, "build", "make -j32")
-result = manager.execute(cmd)
+def build_gateway(profile: str) -> RemoteGateway:
+    return RemoteGateway(profile, config_root=PROJECT_ROOT / "config")
 ```
 
-### Configuration
+This keeps profile resolution pinned to the repository config tree instead of
+silently drifting to a global user config.
 
-Create `config/remote_tmux/profiles.local.yaml` in your project:
+### 4. Use tmux commands through project wrappers
 
-```yaml
-profiles:
-  myserver:
-    ssh_target: user@server.example.com
-    repo_path: ~/my-project
-    session_name: my-ai-session
-```
-
-Add to `.gitignore`:
-```
-config/remote_tmux/profiles.local.yaml
-```
-
-### Updating the Submodule
-
-```bash
-# Update to latest version
-git submodule update --remote external/remote-tmux-manager
-
-# Commit the update
-git add external/remote-tmux-manager
-git commit -m "Update remote-tmux-manager submodule"
-```
-
-## Using as a Standalone Package
-
-### Installation from PyPI (when published)
-
-```bash
-pip install remote-tmux-manager
-```
-
-### Configuration
-
-Create `~/.config/remote-tmux/profiles.yaml`:
-
-```yaml
-profiles:
-  server1:
-    ssh_target: user@server1.example.com
-    repo_path: ~/project1
-
-  server2:
-    ssh_target: user@server2.example.com
-    repo_path: ~/project2
-```
-
-### Usage
-
-```bash
-# Use the standalone CLI
-remote-tmux profiles list
-remote-tmux open --profile server1
-remote-tmux tasks new build --profile server1
-remote-tmux tasks send build --profile server1 -- make -j32
-```
-
-## Example: Chrono-DSA Integration
-
-The original Chrono-DSA project uses this as a submodule:
-
-```bash
-# Project structure
-chrono-dsa/
-├── external/
-│   └── remote-tmux-manager/  # Git submodule
-├── config/
-│   └── remote_tmux/
-│       ├── profiles.example.yaml
-│       └── profiles.local.yaml  # Gitignored
-├── main.py  # Integrates remote commands
-└── ...
-```
-
-In `main.py`:
 ```python
-from remote_tmux.cli import add_remote_subparser
+from remote_tmux.manager import RemoteTmuxManager
 
-# ... existing code ...
-
-# Add remote commands
-add_remote_subparser(subparsers)
+manager = RemoteTmuxManager()
+command = manager.build_send_command(profile, "build-kernel", "make -j32")
+result = manager.execute(command, check=False)
 ```
 
-Now the project has:
+The project wrapper remains responsible for:
+
+- choosing repo-specific task names
+- deciding whether to auto-`cd` into the repo
+- presenting user-facing error messages
+- deciding when `raw=True` is acceptable
+
+## What The Toolkit Should Own
+
+- SSH/BMC readiness probes
+- bounded connectivity recovery
+- tmux session/window creation and inspection
+- task-window state inspection
+- heartbeat event streaming
+- destructive-command blocking before tmux `send`
+
+## What The Toolkit Should Not Own
+
+- experiment sequencing
+- benchmark-specific policies
+- kernel version expectations
+- result parsing or processing
+- project-specific naming conventions
+
+The removed `RemoteExperimentRunner` is the concrete example of this boundary:
+it mixed reusable remote control with higher-level workflow assumptions and was
+not part of the current stable control path.
+
+## Current Stable APIs
+
+Use these as the supported integration surface:
+
+```python
+from remote_server import (
+    ConnectivityStateId,
+    HeartbeatConfig,
+    HeartbeatMonitor,
+    OrchestrationStateId,
+    RemoteGateway,
+    TmuxStateId,
+)
+from remote_tmux import RemoteTmuxManager, load_remote_profiles
+```
+
+If deeper inspection of the state machines is needed, import directly from
+`remote_server.state_machine` rather than relying on broad top-level re-exports.
+
+## Chrono Example
+
+Chrono's stable remote path is:
+
 ```bash
+uv run main.py remote profiles list
+uv run main.py remote status --profile tsinghua
+uv run main.py remote ensure --profile tsinghua
 uv run main.py remote open --profile tsinghua
 uv run main.py remote tasks new build-kernel --profile tsinghua
+uv run main.py remote tasks send build-kernel --profile tsinghua -- "make -j32"
+uv run main.py remote tasks capture build-kernel --profile tsinghua --lines 80
+uv run main.py remote monitor --profile tsinghua --interval 10
 ```
 
-## API Reference
-
-### RemoteProfile
-
-```python
-@dataclass
-class RemoteProfile:
-    name: str
-    ssh_target: str
-    repo_path: str
-    session_name: str
-```
-
-### load_remote_profiles
-
-```python
-def load_remote_profiles(config_root: Path) -> Dict[str, RemoteProfile]:
-    """Load profiles from config_root/remote_tmux/profiles.yaml"""
-```
-
-### RemoteTmuxManager
-
-```python
-class RemoteTmuxManager:
-    def build_open_command(self, profile: RemoteProfile) -> List[str]:
-        """Build command to open/attach session"""
-
-    def build_status_command(self, profile: RemoteProfile) -> List[str]:
-        """Build command to check session status"""
-
-    def build_send_command(
-        self, profile: RemoteProfile, task_name: str,
-        command: str, raw: bool = False
-    ) -> List[str]:
-        """Build command to send keys to task window"""
-
-    def build_capture_command(
-        self, profile: RemoteProfile, task_name: str,
-        lines: int = 120
-    ) -> List[str]:
-        """Build command to capture task output"""
-
-    def execute(self, command: List[str]) -> subprocess.CompletedProcess:
-        """Execute command and return result"""
-
-    def execute_interactive(self, command: List[str]) -> int:
-        """Execute command interactively"""
-```
-
-## Troubleshooting
-
-### Submodule not found
-
-```bash
-git submodule update --init --recursive
-```
-
-### Import errors
-
-```bash
-# Reinstall in development mode
-pip install -e external/remote-tmux-manager
-```
-
-### Config not found
-
-Check that you have one of:
-- `~/.config/remote-tmux/profiles.yaml`
-- `<project>/config/remote_tmux/profiles.local.yaml`
-- `<project>/config/remote_tmux/profiles.yaml`
+That command set is the reference integration target. Anything beyond it should
+be justified by a real project requirement, not by keeping legacy abstractions
+alive.

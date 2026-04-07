@@ -1,7 +1,7 @@
 """Command safety filter for remote operations."""
 
 import re
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 class CommandSafetySuggestion:
@@ -80,30 +80,3 @@ def check_command_safety(command: str) -> Tuple[bool, list]:
     # All checks passed or only warnings
     is_safe = len([s for s in suggestions if s.severity == "error"]) == 0
     return is_safe, suggestions
-
-
-def create_backup_command(file_path: str, backup_suffix: str = ".backup") -> str:
-    """Create a safe backup command.
-
-    Args:
-        file_path: Path to file to backup
-        backup_suffix: Suffix for backup file
-
-    Returns:
-        Safe backup command
-    """
-    return f"cp -p '{file_path}' '{file_path}{backup_suffix}'"
-
-
-def create_safe_delete_command(file_path: str, backup_dir: str = ".deleted") -> str:
-    """Create a safe delete command that moves to backup instead of rm.
-
-    Args:
-        file_path: Path to file to delete
-        backup_dir: Directory to move deleted files to
-
-    Returns:
-        Safe delete command (mv to backup)
-    """
-    timestamp = "$(date +%Y%m%d_%H%M%S)"
-    return f"mkdir -p '{backup_dir}' && mv '{file_path}' '{backup_dir}/$(basename '{file_path}').{timestamp}'"
