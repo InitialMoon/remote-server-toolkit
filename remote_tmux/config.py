@@ -15,6 +15,10 @@ class RemoteProfile:
     ssh_target: str
     repo_path: str
     session_name: str
+    bmc_reset_wait_seconds: int = 480
+    ssh_probe_timeout_seconds: int = 10
+    ssh_recovery_attempts: int = 10
+    ssh_recovery_interval_seconds: int = 10
 
 
 def load_remote_profiles(config_root: Path) -> Dict[str, RemoteProfile]:
@@ -61,6 +65,10 @@ def load_remote_profiles(config_root: Path) -> Dict[str, RemoteProfile]:
             ssh_target=config["ssh_target"],
             repo_path=config["repo_path"],
             session_name=session_name,
+            bmc_reset_wait_seconds=int(config.get("bmc_reset_wait_seconds", 480)),
+            ssh_probe_timeout_seconds=int(config.get("ssh_probe_timeout_seconds", 10)),
+            ssh_recovery_attempts=int(config.get("ssh_recovery_attempts", 10)),
+            ssh_recovery_interval_seconds=int(config.get("ssh_recovery_interval_seconds", 10)),
         )
 
     return profiles

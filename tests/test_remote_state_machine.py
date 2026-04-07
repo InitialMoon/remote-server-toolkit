@@ -413,6 +413,40 @@ class RemoteGatewayInterfaceTests(unittest.TestCase):
         self.assertEqual(report.details["bmc_detail"], "BMC is not configured.")
         self.assertEqual(report.reason, "BMC is not configured.")
 
+    def test_recover_ssh_waits_for_bmc_reset_window_before_polling(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            profile = RemoteProfile(
+                name="tsinghua",
+                ssh_target="Tsinghua_node198",
+                repo_path="~/chrono-dsa",
+                session_name="chrono-exp",
+                bmc_reset_wait_seconds=480,
+                ssh_probe_timeout_seconds=10,
+                ssh_recovery_attempts=10,
+                ssh_recovery_interval_seconds=10,
+            )
+            with patch("remote_server.load_remote_profiles", return_value={"tsinghua": profile}), patch(
+                "remote_server.load_bmc_config", return_value=None
+            ):
+                gateway = RemoteGateway("tsinghua", config_root=Path(tmpdir))
+
+        gateway.bmc = type("FakeBMC", (), {"reset": lambda self: True})()
+        snapshots = [
+            ConnectivitySnapshot(ssh_ok=False, bmc_ok=True, host_powered_on=True),
+            ConnectivitySnapshot(ssh_ok=True, bmc_ok=True, host_powered_on=True),
+        ]
+
+        with patch.object(gateway, "_probe_connectivity_snapshot", side_effect=snapshots), patch(
+            "remote_server.time.sleep"
+        ) as sleep_mock:
+            snapshot = gateway.recover_ssh()
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertTrue(snapshot.ssh_ok)
+        self.assertEqual(sleep_mock.call_args_list[0].args[0], 480)
+        self.assertEqual(sleep_mock.call_args_list[1].args[0], 10)
+
 
 class PublicApiCleanupTests(unittest.TestCase):
     def test_remote_server_does_not_export_legacy_experiment_runner(self) -> None:

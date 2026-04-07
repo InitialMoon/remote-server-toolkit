@@ -142,9 +142,6 @@ __all__ = [
 class RemoteGateway(ConnectivityControlAdapter, TmuxControlAdapter, TaskControlAdapter):
     """Unified gateway that adapts the toolkit's explicit state machines."""
 
-    _SSH_PROBE_TIMEOUT = 10
-    _RECOVERY_ATTEMPTS = 10
-    _RECOVERY_SLEEP_SECONDS = 30
     _CONNECTIVITY_MAX_STEPS = 8
     _TMUX_MAX_STEPS = 8
     _TASK_MAX_STEPS = 8
@@ -396,6 +393,7 @@ class RemoteGateway(ConnectivityControlAdapter, TmuxControlAdapter, TaskControlA
             }
             return None
 
+        time.sleep(self.profile.bmc_reset_wait_seconds)
         return self._poll_connectivity_snapshot(
             action_name="reset",
             stop_when=lambda snapshot: (
@@ -642,7 +640,7 @@ tmux list-panes -t "$SESSION:$TASK" -F "window_exists=true pane_active=#{{pane_a
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=self._SSH_PROBE_TIMEOUT,
+                timeout=self.profile.ssh_probe_timeout_seconds,
             )
         except subprocess.TimeoutExpired:
             return False, "SSH probe timed out."
@@ -661,15 +659,15 @@ tmux list-panes -t "$SESSION:$TASK" -F "window_exists=true pane_active=#{{pane_a
         stop_when,
     ) -> ConnectivitySnapshot | None:
         last_snapshot = None
-        for attempt in range(1, self._RECOVERY_ATTEMPTS + 1):
+        for attempt in range(1, self.profile.ssh_recovery_attempts + 1):
             snapshot = self._probe_connectivity_snapshot()
             self._last_connectivity_details["recovery_action"] = action_name
             self._last_connectivity_details["recovery_attempt"] = attempt
             last_snapshot = snapshot
             if stop_when(snapshot):
                 return snapshot
-            if attempt < self._RECOVERY_ATTEMPTS:
-                time.sleep(self._RECOVERY_SLEEP_SECONDS)
+            if attempt < self.profile.ssh_recovery_attempts:
+                time.sleep(self.profile.ssh_recovery_interval_seconds)
 
         if last_snapshot is not None:
             self._last_connectivity_details["recovery_error"] = (

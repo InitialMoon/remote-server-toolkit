@@ -42,6 +42,40 @@ class RemoteTmuxConfigTests(unittest.TestCase):
             self.assertEqual(profile.ssh_target, "Tsinghua")
             self.assertEqual(profile.repo_path, "~/chrono-dsa")
             self.assertEqual(profile.session_name, "chrono-ai-tsinghua")
+            self.assertEqual(profile.bmc_reset_wait_seconds, 480)
+            self.assertEqual(profile.ssh_probe_timeout_seconds, 10)
+            self.assertEqual(profile.ssh_recovery_attempts, 10)
+            self.assertEqual(profile.ssh_recovery_interval_seconds, 10)
+
+    def test_load_profiles_reads_recovery_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_root = Path(tmpdir)
+            config_dir = config_root / "remote_tmux"
+            config_dir.mkdir(parents=True)
+            (config_dir / "profiles.local.yaml").write_text(
+                textwrap.dedent(
+                    """\
+                    profiles:
+                      tsinghua:
+                        ssh_target: Tsinghua
+                        repo_path: ~/chrono-dsa
+                        session_name: chrono-exp
+                        bmc_reset_wait_seconds: 600
+                        ssh_probe_timeout_seconds: 12
+                        ssh_recovery_attempts: 7
+                        ssh_recovery_interval_seconds: 15
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            profiles = load_remote_profiles(config_root)
+
+            profile = profiles["tsinghua"]
+            self.assertEqual(profile.bmc_reset_wait_seconds, 600)
+            self.assertEqual(profile.ssh_probe_timeout_seconds, 12)
+            self.assertEqual(profile.ssh_recovery_attempts, 7)
+            self.assertEqual(profile.ssh_recovery_interval_seconds, 15)
 
     def test_load_profiles_reports_missing_local_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
