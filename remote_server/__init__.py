@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
 from pathlib import Path
 import subprocess
 import time
@@ -152,6 +153,7 @@ class RemoteGateway(ConnectivityControlAdapter, TmuxControlAdapter, TaskControlA
             config_path = user_config if (user_config / "remote_tmux").exists() else Path.cwd()
         else:
             config_path = Path(config_root)
+        self._config_path = config_path
 
         profiles = load_remote_profiles(config_path)
         if profile_name not in profiles:
@@ -209,6 +211,9 @@ class RemoteGateway(ConnectivityControlAdapter, TmuxControlAdapter, TaskControlA
     def get_connectivity_report(self, auto_recover: bool = False) -> ConnectivityReport:
         """Run the simplified connectivity machine to a terminal state."""
         self._last_connectivity_details = {}
+        grace_report = self._maybe_report_reboot_grace_period()
+        if grace_report is not None:
+            return grace_report
         machine = ConnectivityStateMachine(adapter=self, auto_recover=auto_recover)
         transition = self._step_connectivity_machine(machine)
         reason = transition.reason if transition is not None else "Connectivity machine did not run."
@@ -366,6 +371,7 @@ class RemoteGateway(ConnectivityControlAdapter, TmuxControlAdapter, TaskControlA
             }
             return None
 
+        self._record_reboot_grace_period("power_on")
         return self._poll_connectivity_snapshot(
             action_name="power_on",
             stop_when=lambda snapshot: snapshot.bmc_ok is True and snapshot.host_powered_on is True,
@@ -393,6 +399,7 @@ class RemoteGateway(ConnectivityControlAdapter, TmuxControlAdapter, TaskControlA
             }
             return None
 
+        self._record_reboot_grace_period("reset")
         time.sleep(self.profile.bmc_reset_wait_seconds)
         return self._poll_connectivity_snapshot(
             action_name="reset",
@@ -718,9 +725,81 @@ tmux list-windows -t "$SESSION" -F "#W" | grep -qx "$TASK"
     ) -> ServiceStatus:
         if state == ConnectivityStateId.READY:
             return ServiceStatus.HEALTHY
+        if state == ConnectivityStateId.RECOVERING:
+            return ServiceStatus.DEGRADED
         if state == ConnectivityStateId.FAILED:
             return ServiceStatus.UNKNOWN
         return ServiceStatus.UNHEALTHY
+
+    def _runtime_state_path(self) -> Path:
+        return self._config_path / "remote_tmux" / "runtime_state" / f"{self.profile.name}.json"
+
+    def _load_runtime_state(self) -> dict[str, Any]:
+        path = self._runtime_state_path()
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_runtime_state(self, state: dict[str, Any]) -> None:
+        path = self._runtime_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+    def _clear_runtime_state(self) -> None:
+        path = self._runtime_state_path()
+        if path.exists():
+            path.unlink()
+
+    def _record_reboot_grace_period(self, action: str, *, started_at: float | None = None) -> None:
+        self._save_runtime_state(
+            {
+                "reboot_grace_action": action,
+                "reboot_grace_started_at": time.time() if started_at is None else started_at,
+                "reboot_grace_period_seconds": self.profile.reboot_grace_period_seconds,
+            }
+        )
+
+    def _maybe_report_reboot_grace_period(self) -> ConnectivityReport | None:
+        state = self._load_runtime_state()
+        started_at = state.get("reboot_grace_started_at")
+        action = state.get("reboot_grace_action")
+        grace_seconds = int(
+            state.get("reboot_grace_period_seconds", self.profile.reboot_grace_period_seconds)
+        )
+        if started_at is None or action is None:
+            return None
+
+        snapshot = self._probe_connectivity_snapshot()
+        if snapshot.ssh_ok is True:
+            self._clear_runtime_state()
+            return None
+
+        remaining = int(max(0, round((float(started_at) + grace_seconds) - time.time())))
+        if remaining <= 0:
+            self._clear_runtime_state()
+            return None
+
+        self._last_connectivity_details.update(
+            {
+                "reboot_grace_active": True,
+                "reboot_grace_action": action,
+                "reboot_grace_started_at": float(started_at),
+                "reboot_grace_period_seconds": grace_seconds,
+                "reboot_grace_remaining_seconds": remaining,
+            }
+        )
+        return ConnectivityReport(
+            profile_name=self.profile.name,
+            ssh_target=self.profile.ssh_target,
+            state=ConnectivityStateId.RECOVERING,
+            reason=f"Reboot grace period is active after control-plane initiated {action}.",
+            details=dict(self._last_connectivity_details),
+            history=("reboot_grace_period_active",),
+            timestamp=time.time(),
+        )
 
     def _map_tmux_to_service_status(self, state: TmuxStateId | None) -> ServiceStatus:
         if state == TmuxStateId.WINDOW_READY:

@@ -447,6 +447,68 @@ class RemoteGatewayInterfaceTests(unittest.TestCase):
         self.assertEqual(sleep_mock.call_args_list[0].args[0], 480)
         self.assertEqual(sleep_mock.call_args_list[1].args[0], 10)
 
+    def test_connectivity_report_stays_recovering_within_reboot_grace_period(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config_root = Path(tmpdir)
+            profile = RemoteProfile(
+                name="tsinghua",
+                ssh_target="Tsinghua_node198",
+                repo_path="~/chrono-dsa",
+                session_name="chrono-exp",
+                bmc_reset_wait_seconds=300,
+                reboot_grace_period_seconds=300,
+                ssh_probe_timeout_seconds=10,
+                ssh_recovery_attempts=10,
+                ssh_recovery_interval_seconds=10,
+            )
+            with patch("remote_server.load_remote_profiles", return_value={"tsinghua": profile}), patch(
+                "remote_server.load_bmc_config", return_value=None
+            ):
+                gateway = RemoteGateway("tsinghua", config_root=config_root)
+
+        gateway._record_reboot_grace_period("reset", started_at=1_000.0)
+        with patch.object(
+            gateway,
+            "_probe_connectivity_snapshot",
+            return_value=ConnectivitySnapshot(ssh_ok=False, bmc_ok=True, host_powered_on=True),
+        ), patch("remote_server.time.time", return_value=1_100.0):
+            report = gateway.get_connectivity_report(auto_recover=False)
+
+        self.assertEqual(report.state, ConnectivityStateId.RECOVERING)
+        self.assertEqual(report.reason, "Reboot grace period is active after control-plane initiated reset.")
+        self.assertTrue(report.details["reboot_grace_active"])
+        self.assertEqual(report.details["reboot_grace_remaining_seconds"], 200)
+
+    def test_connectivity_report_clears_reboot_grace_period_once_ssh_is_ready(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config_root = Path(tmpdir)
+            profile = RemoteProfile(
+                name="tsinghua",
+                ssh_target="Tsinghua_node198",
+                repo_path="~/chrono-dsa",
+                session_name="chrono-exp",
+                bmc_reset_wait_seconds=300,
+                reboot_grace_period_seconds=300,
+                ssh_probe_timeout_seconds=10,
+                ssh_recovery_attempts=10,
+                ssh_recovery_interval_seconds=10,
+            )
+            with patch("remote_server.load_remote_profiles", return_value={"tsinghua": profile}), patch(
+                "remote_server.load_bmc_config", return_value=None
+            ):
+                gateway = RemoteGateway("tsinghua", config_root=config_root)
+
+        gateway._record_reboot_grace_period("reset", started_at=1_000.0)
+        with patch.object(
+            gateway,
+            "_probe_connectivity_snapshot",
+            return_value=ConnectivitySnapshot(ssh_ok=True, bmc_ok=True, host_powered_on=True),
+        ), patch("remote_server.time.time", return_value=1_100.0):
+            report = gateway.get_connectivity_report(auto_recover=False)
+
+        self.assertEqual(report.state, ConnectivityStateId.READY)
+        self.assertFalse((config_root / "remote_tmux" / "runtime_state" / "tsinghua.json").exists())
+
 
 class PublicApiCleanupTests(unittest.TestCase):
     def test_remote_server_does_not_export_legacy_experiment_runner(self) -> None:

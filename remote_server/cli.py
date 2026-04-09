@@ -1,11 +1,11 @@
 """Unified CLI for Remote Server Toolkit."""
 
 import argparse
-import sys
 import signal
-from pathlib import Path
+import sys
 
 from remote_server import RemoteGateway, monitor_server_with_heartbeat
+from remote_server.state_machine import ConnectivityStateId
 from remote_tmux.cli import add_remote_subparser as add_tmux_subparser
 
 
@@ -53,6 +53,18 @@ def cmd_ensure(args):
                 f"  connectivity={report.connectivity_state.value} "
                 f"orchestration={report.orchestration_state.value}"
             )
+            print(f"  reason={report.reason}")
+            sys.exit(0)
+
+        if report.connectivity_state == ConnectivityStateId.RECOVERING:
+            print(f"… Remote {args.profile} is recovering")
+            print(
+                f"  connectivity={report.connectivity_state.value} "
+                f"orchestration={report.orchestration_state.value}"
+            )
+            remaining = report.details.get("reboot_grace_remaining_seconds")
+            if remaining is not None:
+                print(f"  remaining={remaining}s")
             print(f"  reason={report.reason}")
             sys.exit(0)
 

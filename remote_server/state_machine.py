@@ -279,6 +279,7 @@ class ConnectivityStateId(Enum):
     HOST_POWERED_OFF = "host_powered_off"
     CHECKING_SSH = "checking_ssh"
     SSH_UNAVAILABLE = "ssh_unavailable"
+    RECOVERING = "recovering"
     READY = "ready"
     FAILED = "failed"
 
@@ -407,6 +408,19 @@ DEFAULT_CONNECTIVITY_STATE_SPECS: dict[ConnectivityStateId, StateSpec] = {
         exit_conditions=("ssh_recovery_started", "recovery_disabled", "recovery_failed"),
         exit_description="Leave when SSH recovery starts, when auto-recovery is disabled, or when the recovery action fails.",
         terminal=False,
+    ),
+    ConnectivityStateId.RECOVERING: StateSpec(
+        id=ConnectivityStateId.RECOVERING,
+        layer="connectivity",
+        kind=StateKind.WAIT,
+        summary="A control-plane initiated reboot/reset is still within its grace period.",
+        evidence_keys=("last_probe", "reboot_grace_active", "reboot_grace_remaining_seconds"),
+        evidence_description="The toolkit previously triggered a reboot/reset and recorded a grace period. During that window, transient BMC or SSH failures should be treated as in-progress recovery instead of a hard failure.",
+        allowed_actions=(),
+        action_description="No new recovery action is allowed from this node; callers should keep waiting or re-check later.",
+        exit_conditions=("ssh_restored", "grace_period_expired"),
+        exit_description="Leave once SSH becomes reachable again or the grace period expires.",
+        terminal=True,
     ),
     ConnectivityStateId.READY: StateSpec(
         id=ConnectivityStateId.READY,
