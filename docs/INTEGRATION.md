@@ -20,8 +20,8 @@ here for detailed examples and diagrams.
 
 Keep the split explicit:
 
-- project CLI: commands such as `status`, `ensure`, `monitor`, `open`,
-  `tasks send`, `tasks capture`
+- project CLI: commands such as `profiles`, `status`, `health`, `ensure`,
+  `monitor`
 - toolkit facade: `RemoteGateway`
 - toolkit transport layer: `RemoteTmuxManager`
 - toolkit monitoring layer: `HeartbeatMonitor`
@@ -231,10 +231,7 @@ Chrono's stable remote path is:
 uv run main.py remote profiles list
 uv run main.py remote status --profile tsinghua
 uv run main.py remote ensure --profile tsinghua
-uv run main.py remote open --profile tsinghua
-uv run main.py remote tasks new build-kernel --profile tsinghua
-uv run main.py remote tasks send build-kernel --profile tsinghua -- "make -j32"
-uv run main.py remote tasks capture build-kernel --profile tsinghua --lines 80
+ssh Tsinghua_node198 'cd ~/chrono-dsa && <remote command>'
 uv run main.py remote monitor --profile tsinghua --interval 10
 ```
 
@@ -267,40 +264,29 @@ while.
   managed tmux session/window, and it only succeeds once the top-level
   orchestration state reaches `inspecting_task`.
 
-### 2. Attach for manual inspection
-
-```bash
-uv run main.py remote open --profile tsinghua
-```
-
-This attaches to the managed tmux session. In Chrono this is useful for:
-
-- checking the remote shell environment
-- confirming the repo path before dispatching a task
-- manually inspecting tmux state when debugging
-
-### 3. Run audited work through task windows
+### 2. Codex/agent path: one-shot remote commands over standard ssh
 
 ```bash
 uv run main.py remote ensure --profile tsinghua
-uv run main.py remote tasks new build-kernel --profile tsinghua
-uv run main.py remote tasks send build-kernel --profile tsinghua -- \
-  "cd ~/chrono-dsa/kernel/chrono && make -j32"
-uv run main.py remote tasks capture build-kernel --profile tsinghua --lines 120
+ssh Tsinghua_node198 'cd ~/chrono-dsa/kernel/chrono && make -j32'
 ```
 
-This is the preferred path for real work because it keeps command history and
-output in tmux instead of scattering them across ad-hoc SSH shells.
+This is now the preferred Chrono path for agent-driven work because it keeps
+the command surface close to standard shell/ssh usage and does not depend on a
+custom Codex shell backend.
+
+Chrono's Codex hook layer then adds minimal safety checks on top:
+
+- only configured SSH targets are allowed
+- interactive ssh without a remote payload is denied
+- obvious high-risk remote reboot/shutdown/formatting/raw-device-write payloads are denied
+- safe `/dev/null` redirection and `dd ... of=/dev/null` are allowed
 
 Minimal smoke test:
 
 ```bash
 uv run main.py remote ensure --profile tsinghua
-uv run main.py remote tasks new smoke-check --profile tsinghua
-uv run main.py remote tasks send smoke-check --profile tsinghua -- \
-  "printf 'REMOTE_OK:%s\n' \"\$(hostname)\""
-uv run main.py remote tasks capture smoke-check --profile tsinghua --lines 40
-uv run main.py remote tasks close smoke-check --profile tsinghua
+ssh Tsinghua_node198 'cd ~/chrono-dsa && printf "REMOTE_OK:%s\n" "$(hostname)"'
 ```
 
 ### 4. Monitor only when continuous observation matters
@@ -330,7 +316,7 @@ The current monitor output is a structured event stream derived from
 project-side remote workflow. Keep these boundaries explicit:
 
 - one-shot AI or human interaction can usually rely on repeated
-  `ensure/status/capture` calls
+  `ensure/status/health` calls
 - `monitor` is only needed when state transitions themselves need to be
   observed over time
 - heartbeat should not own project-specific experiment sequencing

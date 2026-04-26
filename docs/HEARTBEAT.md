@@ -25,7 +25,7 @@
 
 当前项目里要先区分两种使用模式：
 
-- 一问一答式 AI：默认模式是每轮主动执行 `remote ensure/status` 与 `remote tasks capture`
+- 一问一答式 AI：默认模式是先执行 `remote ensure/status`，再通过标准 `ssh <alias> 'cd ~/chrono-dsa && <command>'` 触发远端命令
 - 持续进程或人工观察终端：才适合使用 `HeartbeatMonitor` / `remote monitor`
 
 所以，heartbeat 不解决“AI 每轮能不能主动查状态”这个问题；那个问题仅靠主动轮询也能解决。
@@ -49,7 +49,7 @@ heartbeat 真正额外提供的是**连续上下文**：
 - 推进 pmbench 或结果处理流程
 - 维护项目级“实验状态机”
 
-如果只是当前对话里的 AI 每轮主动查一次状态，那么 `remote ensure/status + tasks` 往往已经足够，heartbeat 不是必须组件。
+如果只是当前对话里的 AI 每轮主动查一次状态，那么 `remote ensure/status + ssh` 往往已经足够，heartbeat 不是必须组件。
 
 ## 事件模型
 
@@ -143,7 +143,7 @@ uv run main.py remote monitor --profile tsinghua --interval 15
 ## 使用原则
 
 - 先有明确的后台监控需求，再用 heartbeat
-- 默认工作流优先记 `remote ensure + remote tasks`，不是 `remote monitor`
+- 默认工作流优先记 `remote ensure + ssh`，不是 `remote monitor`
 - 不要把 heartbeat 当作普通状态检查的默认入口
 - heartbeat 只决定“要不要再尝试一次 recovery”，真正的 recovery 细节仍由 `RemoteGateway` 和各层 state machine 执行
 - 真正的 BMC / reboot 动作仍受根 `AGENTS.md` 的安全约束
